@@ -28,9 +28,10 @@ class Cfg:
     ff_mult = 4
     dropout = 0.1
     # Windows
-    seconds = 2.0
+    seconds = 0.1  # Reduced seconds for smaller sequence
+    max_seq_len = 4096 # Further reduced max sequence length config
     # Stems
-    stems = ["VOCALS", "DRUMS", "BASS", "OTHER"]  # control tokens
+    stems = ["VOCALS", "SQUARE", "DRUMS", "BASS", "OTHER"]  # added 'SQUARE' stem
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 cfg = Cfg()
@@ -182,7 +183,8 @@ class GPTBlock(nn.Module):
         )
     def forward(self, x, attn_mask):
         h = self.ln1(x)
-        # attn_mask: (L,L) with True = block attention (causal)
+        # attn_mask should have shape (B, L, L) or (L, L) when batch_first=True
+        # We pass (B, L, L) from GPT forward, potentially (B * n_heads, L, L)
         y, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
         x = x + y
         h = self.ln2(x)
@@ -193,12 +195,14 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, d_model, n_layers, n_heads, ff_mult, dropout):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model)
-        self.pos = nn.Parameter(torch.zeros(1, 32768, d_model))  # big cap; or switch to RoPE
+        # Use cfg.max_seq_len for positional embedding
+        self.pos = nn.Parameter(torch.zeros(1, cfg.max_seq_len, d_model))
         self.blocks = nn.ModuleList([
             GPTBlock(d_model, n_heads, ff_mult, dropout) for _ in range(n_layers)
         ])
         self.ln = nn.LayerNorm(d_model)
         self.out = nn.Linear(d_model, vocab_size)
+        self.n_heads = n_heads # Store n_heads for mask creation
 
     def forward(self, tokens, loss_mask=None):
         """
@@ -216,6 +220,9 @@ class GPT(nn.Module):
         x = self.embed(tokens) + self.pos[:, :L, :]
         # causal mask: no lookahead
         causal = torch.triu(torch.ones(L, L, device=tokens.device, dtype=torch.bool), diagonal=1)
+        # Repeat causal mask for each head
+        causal = causal.unsqueeze(0).repeat(B * self.n_heads, 1, 1)
+
         for blk in self.blocks:
             x = blk(x, causal)
         x = self.ln(x)
@@ -263,7 +270,7 @@ def load_wav(path, target_sr):
 # =========================
 # End-to-end: one batch example
 # =========================
-def make_batch(mix_wav, stem_wav, stem_name):
+def make_batch(mix_wav, stem_wav, stem_name: str):
     """
     Build a (1, L) token batch and loss mask for one 2s window.
     """
@@ -280,10 +287,16 @@ def make_batch(mix_wav, stem_wav, stem_name):
 
     # Pack
     seq, mask = pack_sequence(mix_tok, stem_name, stem_tok)
+
+    # Trim to max_seq_len
+    if seq.numel() > cfg.max_seq_len:
+        seq = seq[:cfg.max_seq_len]
+        mask = mask[:cfg.max_seq_len]
+
     return seq.unsqueeze(0).to(device), mask.unsqueeze(0).to(device), mix_phase, mix_mag.shape
 
 @torch.no_grad()
-def greedy_decode(model, mix_tokens, stem_name, max_new=None):
+def greedy_decode(model, mix_tokens, stem_name: str, max_new=None):
     """
     mix_tokens: (Lmix,) long
     Returns full sequence including prefix+generated tokens.
@@ -299,39 +312,65 @@ def greedy_decode(model, mix_tokens, stem_name, max_new=None):
     seq = seq.unsqueeze(0)  # (1, L)
     # generate until EOS or max_new
     max_new = max_new or (mix_tokens.numel() + 1024)  # cap
+    # Cap generation length at max_seq_len
+    max_new = min(max_new, cfg.max_seq_len - seq.size(1))
     for _ in range(max_new):
         logits, _ = model(seq)
         next_logits = logits[:, -1, :]
         next_tok = torch.argmax(next_logits, dim=-1)  # shape: (1,)
-        seq = torch.cat([seq, next_tok.unsqueeze(1)], dim=1)  # fix shape here
+        seq = torch.cat([seq, next_tok.unsqueeze(1)], dim=1)
         if int(next_tok.item()) == vocab.EOS:
             break
     return seq.squeeze(0)
+
 
 def reconstruct_from_sequence(seq, mix_phase, spec_shape, target_len):
     """
     Extract predicted target tokens from seq and reconstruct WAV via mixture phase.
     """
-    # Locate SEP index robustly
+    # Locate SEP index
     sep_pos = (seq == vocab.SEP).nonzero(as_tuple=True)[0]
     if sep_pos.numel() == 0:
-        raise ValueError("SEP token not found in sequence")
-    sep_idx = sep_pos[-1].item()
-    start = sep_idx + 2  # skip SEP and STEM token
-
-    # Collect until EOS, but clamp to expected length
-    eos_pos = (seq[start:] == vocab.EOS).nonzero(as_tuple=True)[0]
-    max_target = spec_shape[0] * spec_shape[1]
-    if eos_pos.numel() > 0:
-        end = start + int(eos_pos[0].item())
+        print("Warning: SEP token not found in sequence. Reconstruction may be incomplete.")
+        # If SEP is not found, assume the entire sequence after the prefix is target tokens
+        # (2 for BOS, MIX + mix_tokens length)
+        prefix_len = 2 + (mix_phase.shape[0] * mix_phase.shape[1]) # Approximate mix token length from spec shape
+        start = prefix_len + 1 + 1 # after BOS, MIX, mix_tokens, SEP, STEM
+        start = min(start, seq.numel()) # Ensure start is within bounds
+        predicted_tokens_segment = seq[start:]
     else:
-        end = min(start + max_target, len(seq))
-    tgt_tokens = seq[start:end]
+        sep_idx = sep_pos[-1].item()
+        start = sep_idx + 2  # skip SEP and STEM token
+
+        # Collect predicted tokens until EOS or end of sequence
+        eos_pos = (seq[start:] == vocab.EOS).nonzero(as_tuple=True)[0]
+        if eos_pos.numel() > 0:
+            end = start + int(eos_pos[0].item())
+        else:
+            end = len(seq)
+        predicted_tokens_segment = seq[start:end]
+
+    # Determine the expected length of the target token sequence
+    expected_len = spec_shape[0] * spec_shape[1]
+
+    # Explicitly pad or trim the predicted tokens to the expected length
+    if predicted_tokens_segment.numel() < expected_len:
+        pad_len = expected_len - predicted_tokens_segment.numel()
+        # Pad with a valid quantized bin (e.g., 0 for lowest magnitude)
+        tgt_tokens_padded = torch.cat([predicted_tokens_segment, torch.full((pad_len,), 0, device=predicted_tokens_segment.device, dtype=torch.long)])
+    else:
+        tgt_tokens_padded = predicted_tokens_segment[:expected_len] # Trim if longer
+
+    # Ensure the tensor is detached before dequantization if it's not already
+    tgt_tokens_padded = tgt_tokens_padded.detach()
+
     # Dequantize to magnitude
-    pred_mag = dequantize_to_mag(tgt_tokens, spec_shape).to(mix_phase.device)
+    pred_mag = dequantize_to_mag(tgt_tokens_padded, spec_shape).to(mix_phase.device)
+
     # Use mixture phase for reconstruction
     wav = istft_from_mag_phase(pred_mag, mix_phase, target_len)
     return wav.clamp(-1, 1)
+
 
 def demo_step(model, optimizer, mix_wav, stem_wav, stem_name="VOCALS"):
     """
@@ -339,22 +378,42 @@ def demo_step(model, optimizer, mix_wav, stem_wav, stem_name="VOCALS"):
     """
     # Build batch
     seq, mask, mix_phase, spec_shape = make_batch(mix_wav, stem_wav, stem_name)
+    # Visibility into how many target tokens are being trained this step
+    mask_tokens = int(mask.sum().item())
+    print(f"[debug] loss_mask target tokens this step: {mask_tokens}")
+    # Ensure we actually have a training signal (with our shorter STFT, we should)
+    # assert mask_tokens > 0, "Loss mask is empty—target tokens were entirely truncated. Increase max_seq_len or cut STFT/tokenization further."
+
     model.train()
     logits, loss = model(seq, loss_mask=mask)
     optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
+    # Only call backward if loss requires grad
+    if loss is not None and loss.requires_grad:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
     # Greedy decode (eval)
     model.eval()
-    mix_tok = seq[0, 2:2+spec_shape[0]*spec_shape[1]]  # slice of mixture tokens
+    # Slice of mixture tokens must also be capped at max_seq_len
+    # The mix_tokens slice should match the part of the sequence that represents the mixture tokens
+    # This is from after BOS and MIX tokens up to the SEP token
+    sep_pos = (seq[0] == vocab.SEP).nonzero(as_tuple=True)[0]
+    if sep_pos.numel() > 0:
+        mix_tok_end = sep_pos[0].item()
+    else:
+        # If SEP not found (e.g., trimmed), approximate based on expected mix token length
+        mix_tok_end = 2 + (spec_shape[0] * spec_shape[1]) # BOS, MIX + mix_tokens
+        mix_tok_end = min(mix_tok_end, seq.size(1)) # Cap at actual seq length
+
+    mix_tok = seq[0, 2:mix_tok_end] # slice after BOS and MIX tokens
+
     with torch.no_grad():
         full = greedy_decode(model, mix_tok, stem_name)
     # Reconstruct predicted stem
     target_len = mix_wav.numel()
     pred_wav = reconstruct_from_sequence(full, mix_phase, spec_shape, target_len)
-    return float(loss.item()), pred_wav
+    return float(loss.item()) if loss is not None else float('nan'), pred_wav
 
 # =========================
 # Main (toy run)
@@ -365,16 +424,19 @@ if __name__ == "__main__":
     print("Device:", device)
 
     # For a smoke test without a dataset, synthesize a trivial mixture:
-    # mixture = sine(220Hz) + noise; "VOCALS" = sine; "OTHER" = noise
+    # mixture = sine(440Hz) + square(523Hz) + noise
+    # "VOCALS" = sine(440Hz); "SQUARE" = square(523Hz)
     T = int(cfg.seconds * cfg.sr)
     t = torch.linspace(0, cfg.seconds, T, dtype=torch.float32)
-    sine = 0.5*torch.sin(2*math.pi*220*t)
+    sine = 0.5*torch.sin(2*math.pi*440*t)
+    square = 0.3*torch.sign(torch.sin(2*math.pi*523*t))
     noise = 0.1*torch.randn_like(sine)
     vocals = sine
+    # Keep 'other' as just noise; square is now its own stem
     other = noise
-    mix = (vocals + other).to(device)
+    mix = (vocals + square + other).to(device)
 
-    # Pad/trim exactly 2s
+    # Pad/trim exactly cfg.seconds
     mix = pad_or_trim(mix, T)
     vocals = pad_or_trim(vocals.to(device), T)
 
@@ -393,6 +455,59 @@ if __name__ == "__main__":
     loss, pred = demo_step(model, opt, mix, vocals, stem_name="VOCALS")
     print("Loss:", loss)
 
+    path = "/content/drive/MyDrive/MSS_Audio/"
+
+    torchaudio.save(path + "mixture_test.wav", mix.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote mixture_test.wav")
+    
     # Save predicted wav for inspection
-    torchaudio.save("pred_vocals_demo.wav", pred.unsqueeze(0).cpu(), cfg.sr)
+    torchaudio.save(path + "pred_vocals_demo.wav", pred.unsqueeze(0).cpu(), cfg.sr)
     print("Wrote pred_vocals_demo.wav")
+
+    # === Square stem: train+decode and save ===
+    loss_sq, pred_sq = demo_step(model, opt, mix, square.to(device), stem_name="SQUARE")
+    print("Square Loss:", loss_sq)
+    torchaudio.save(path + "pred_square_demo.wav", pred_sq.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote pred_square_demo.wav")
+
+    # === Ground-truth recon sanity checks ===
+    # 1) Save the clean target (should be a pure 440 Hz tone)
+    torchaudio.save(path + "target_vocals_ground_truth.wav", vocals.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote target_vocals_ground_truth.wav")
+
+    # 2) Quantize→dequantize the stem and reconstruct with STEM PHASE (cleanest)
+    with torch.no_grad():
+        stem_mag_dbg, stem_phase_dbg = stft_mag_phase(vocals)
+        stem_log_dbg = to_logmag(stem_mag_dbg)
+        stem_tok_dbg = quantize_logmag(stem_log_dbg)
+        deq_mag_dbg = dequantize_to_mag(stem_tok_dbg, stem_mag_dbg.shape).to(stem_phase_dbg.device)
+        recon_gt_stemphase = istft_from_mag_phase(deq_mag_dbg, stem_phase_dbg, T).clamp(-1, 1)
+    torchaudio.save(path + "recon_from_gt_tokens.wav", recon_gt_stemphase.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote recon_from_gt_tokens.wav")
+
+    # 3) Same dequantized magnitude but use MIXTURE PHASE (slightly dirtier)
+    with torch.no_grad():
+        mix_mag_dbg, mix_phase_dbg = stft_mag_phase(mix)
+        recon_gt_mixphase = istft_from_mag_phase(deq_mag_dbg, mix_phase_dbg, T).clamp(-1, 1)
+    #torchaudio.save(path + "recon_from_gt_tokens_mixphase.wav", recon_gt_mixphase.unsqueeze(0).cpu(), cfg.sr)
+    torchaudio.save(path + "recon_from_gt_tokens_mixphase.wav", recon_gt_mixphase.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote recon_from_gt_tokens_mixphase.wav")
+
+    # === Ground-truth & recon for SQUARE stem ===
+    # 1) Clean square
+    torchaudio.save(path + "target_square_ground_truth.wav", square.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote target_square_ground_truth.wav")
+    # 2) Quantize→dequantize square then reconstruct with SQUARE PHASE
+    with torch.no_grad():
+        sq_mag_dbg, sq_phase_dbg = stft_mag_phase(square.to(device))
+        sq_log_dbg = to_logmag(sq_mag_dbg)
+        sq_tok_dbg = quantize_logmag(sq_log_dbg)
+        deq_sq_mag_dbg = dequantize_to_mag(sq_tok_dbg, sq_mag_dbg.shape).to(sq_phase_dbg.device)
+        sq_recon_stemphase = istft_from_mag_phase(deq_sq_mag_dbg, sq_phase_dbg, T).clamp(-1, 1)
+    torchaudio.save(path + "square_recon_from_gt_tokens.wav", sq_recon_stemphase.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote square_recon_from_gt_tokens.wav")
+    # 3) Same dequantized magnitude but use MIXTURE PHASE
+    with torch.no_grad():
+        sq_recon_mixphase = istft_from_mag_phase(deq_sq_mag_dbg, mix_phase_dbg, T).clamp(-1, 1)
+    torchaudio.save(path + "square_recon_from_gt_tokens_mixphase.wav", sq_recon_mixphase.unsqueeze(0).cpu(), cfg.sr)
+    print("Wrote square_recon_from_gt_tokens_mixphase.wav")
